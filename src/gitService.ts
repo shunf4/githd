@@ -500,18 +500,35 @@ export class GitService {
   }
 
   private async _getRemoteUrl(fsPath: string): Promise<string> {
-    let remote = (await this._exec(['remote', 'get-url', '--push', 'origin'], fsPath)).trim();
-    if (remote.startsWith('git@')) {
-      remote = remote.replace(':', '/').replace('git@', 'https://');
+    let url;
+
+    try {
+      let headSymbolicRef = (await this._exec(['symbolic-ref', '-q', 'HEAD'], fsPath)).trim();
+      if (headSymbolicRef == '') {
+        throw '';
+      }
+
+      let remote = (await this._exec(['for-each-ref', '--format="%(upstream:remotename)"', headSymbolicRef], fsPath)).trim();
+      if (headSymbolicRef == '') {
+        throw '';
+      }
+
+      url = (await this._exec(['remote', 'get-url', '--push', remote], fsPath)).trim();
+    } catch (e) {
+      url = '';
     }
-    let url = remote.replace(/\.git$/g, '');
+
+    if (url.startsWith('git@')) {
+      url = url.replace(':', '/').replace('git@', 'https://');
+    }
+    url = url.replace(/\.git$/g, '');
     // Do a best guess if it's a valid git repository url. In case user configs
     // the host name.
     if (url.search(/\.(com|org|net|io|cloud)\//g) > 0) {
       return url;
     }
 
-    Tracer.info('Remote URL: ' + remote);
+    Tracer.info('Remote URL: ' + url);
     // If it's not considered as a valid one, we try to compose a github one.
     return url.replace(/:\/\/.*?\//g, '://github.com/');
   }
@@ -519,10 +536,11 @@ export class GitService {
   private async _exec(args: string[], cwd: string): Promise<string> {
     const start = Date.now();
     const cmd = this._gitPath + ' ' + args.join(' ');
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
       exec(cmd, { encoding: 'utf8', cwd }, (err, stdout) => {
         if (err) {
           Tracer.error(`git command failed: ${cmd} (${Date.now() - start}ms) ${cwd} ${err.message}`);
+          reject(err);
         } else {
           Tracer.verbose(`git command: ${cmd}. Output size: ${stdout.length} (${Date.now() - start}ms) ${cwd}`);
           resolve(stdout);
