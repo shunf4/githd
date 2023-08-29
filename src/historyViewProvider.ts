@@ -272,6 +272,7 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
     const isStash = context.isStash ?? false;
     const firstLoading = this._leftCount == 0;
     let logCount = this._express ? 2 * firstLoadingCount : firstLoadingCount;
+    let contentBackup;
     if (firstLoading) {
       if (loadMore) {
         this._content = this._content.substring(0, this._content.length - moreLabel.length - 1);
@@ -280,9 +281,14 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
       } else {
         this._reset();
       }
+      contentBackup = this._content;
+      this._content = contentBackup + '\n\nLoading...';
+      this._update();
 
-      // No pagination loading for statsh, file history and line history.
-      if (isStash || context.specifiedPath) {
+      // No pagination loading for statsh, ~file history and line history~.
+      // No pagination loading for stash.
+      // if (isStash || context.specifiedPath) {
+      if (isStash) {
         logCount = Number.MAX_SAFE_INTEGER;
       } else {
         const commitsCount = await this._gitService.getCommitsCount(context.repo, context.branch, context.author);
@@ -297,7 +303,11 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
       logCount = this._express ? 5 * loadingPageSize : loadingPageSize;
       logCount = Math.min(logCount, this._leftCount);
       this._leftCount = this._leftCount - logCount;
+      contentBackup = this._content;
+      this._content = contentBackup + '\nLoading...';
+      this._update();
     }
+    
 
     const entries: GitLogEntry[] = await this._gitService.getLogEntries(
       context.repo,
@@ -311,8 +321,8 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
       context.author
     );
     if (entries.length === 0) {
-      this._reset();
-      this._content = isStash ? 'No Stash' : 'No History';
+      // this._reset();
+      this._content = contentBackup + (isStash ? 'No Stash' : 'No History') + "\n";
       this._update();
       return;
     }
@@ -343,7 +353,7 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
       this._totalCommitsCount = 0;
     }
 
-    this._content += content;
+    this._content = contentBackup + content;
     if (this._content == prevContent) {
       this._setDecorations(getHistoryViewEditor());
       this._updating = false;

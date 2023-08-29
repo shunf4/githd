@@ -303,7 +303,9 @@ export class GitService {
         if (line) {
           args.push(`-L ${line},${line}:${filePath}`);
         } else {
-          args.push('--follow', filePath);
+          // --follow seems not respect --skip=N. Now that we limit log entries for file history...
+          // args.push('--follow', filePath);
+          args.push(filePath);
         }
       }
     }
