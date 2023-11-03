@@ -100,6 +100,9 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
   private _expressStatusBar: vs.StatusBarItem = vs.window.createStatusBarItem(undefined, 2);
   private _express = false;
 
+  private _updateContentLock: Promise<void> = Promise.resolve();
+  private _updateContentLockToken = "";
+
   constructor(context: vs.ExtensionContext, private _model: Model, private _gitService: GitService) {
     Tracer.info('Creating history view');
     context.subscriptions.push(vs.workspace.registerTextDocumentContentProvider(HistoryViewProvider.scheme, this));
@@ -251,10 +254,26 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
     this._onDidChange.fire(HistoryViewProvider.defaultUri);
   }
 
+  private async _updateContent(loadMore: boolean): Promise<void> {
+    Tracer.verbose(`Waiting for _updateContentLockToken: ${this._updateContentLockToken}`);
+    await this._updateContentLock;
+    Tracer.verbose(`Done waiting for _updateContentLockToken: ${this._updateContentLockToken}`);
+    let currResolve: ((value: void | PromiseLike<void>) => void) | null = null;
+    this._updateContentLock = new Promise((resolve) => { currResolve = resolve; });
+    this._updateContentLockToken = Math.random().toString(36).slice(2, 7);
+    Tracer.verbose(`Lock _updateContentLockToken: ${this._updateContentLockToken}`);
+    try {
+      await this._updateContentWorker(loadMore);
+    } finally {
+      Tracer.verbose(`Unlock _updateContentLockToken: ${this._updateContentLockToken}`);
+      currResolve!();
+    }
+  }
+
   // When start showing the history view page, we do two phase loading for better
   // user experience. Firstly, it displays the first firstLoadingCount entries.
   // Then, it displays the left ones right after the first displaying.
-  private async _updateContent(loadMore: boolean): Promise<void> {
+  private async _updateContentWorker(loadMore: boolean): Promise<void> {
     const context = this._model.historyViewContext;
     if (!context) {
       return;
@@ -291,12 +310,23 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
       if (isStash) {
         logCount = Number.MAX_SAFE_INTEGER;
       } else {
-        const commitsCount = await this._gitService.getCommitsCount(context.repo, context.branch, context.author);
+        Tracer.verbose('getCommitsCount');
+        // TODO: Still wrong commitsCount when viewing line history
+        const commitsCount = await this._gitService.getCommitsCount(context.repo, context.branch, context.author, context.specifiedPath);
+        Tracer.verbose(`commitCount ${commitsCount}`);
+        Tracer.verbose(`this._logCount ${this._logCount}`);
+        Tracer.verbose(`this._commitsCount ${this._commitsCount}`);
+
         let loadingCount = Math.min(commitsCount - this._logCount, this._commitsCount);
+        Tracer.verbose(`loadingCount ${loadingCount}`);
+        Tracer.verbose(`this._loadAll ${this._loadAll}`);
         if (this._loadAll) {
           loadingCount = commitsCount - this._logCount;
         }
+        Tracer.verbose(`loadingCount ${loadingCount}`);
+        Tracer.verbose(`firstLoadingCount ${firstLoadingCount}`);
         this._leftCount = Math.max(0, loadingCount - firstLoadingCount);
+        Tracer.verbose(`this._leftCount ${this._leftCount}`);
         this._totalCommitsCount = commitsCount;
       }
     } else {

@@ -170,13 +170,19 @@ export class GitService {
     return (await this._exec(['rev-parse', '--abbrev-ref', 'HEAD'], repo.root)).trim();
   }
 
-  async getCommitsCount(repo: GitRepo, branch: string, author?: string): Promise<number> {
+  async getCommitsCount(repo: GitRepo, branch: string, author?: string, fileUri?: vs.Uri): Promise<number> {
     if (!repo) {
       return 0;
     }
     let args: string[] = ['rev-list', '--simplify-merges', '--count', branch];
     if (author) {
       args.push(`--author=${author}`);
+    }
+    if (fileUri) {
+      const gitRelFilePath = (await this.getGitRelativePath(fileUri)) ?? '.';
+      // --follow seems not respect --skip=N. Now that we limit log entries for file history...
+      // args.push('--follow', filePath);
+        args.push(gitRelFilePath);
     }
     return parseInt(await this._exec(args, repo.root));
   }
