@@ -2,7 +2,7 @@
     "name": "githd",
     "displayName": "Git History Diff",
     "description": "View git history. View diff of committed files. View git blame info. View stash details.",
-    "version": "2.3.3+shunf4-mod-1",
+    "version": "2.3.3+shunf4-mod-2",
     "publisher": "huizhou",
     "author": {
         "name": "Hui Zhou",
@@ -70,7 +70,7 @@
                 },
                 "githd.logView.displayExpressStatus": {
                     "type": "boolean",
-                    "default": true,
+                    "default": false,
                     "description": "Display the express mode setting on the status bar"
                 },
                 "githd.blameView.enabled": {
@@ -80,12 +80,12 @@
                 },
                 "githd.editor.disabled": {
                     "type": "boolean",
-                    "default": false,
+                    "default": true,
                     "description": "Disable GitHD shortcut in editor"
                 },
                 "githd.traceLevel": {
                     "type": "string",
-                    "default": "silent",
+                    "default": "info",
                     "description": "The trace level set to see githd logs from output window.",
                     "enum": [
                         "silent",
