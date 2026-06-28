@@ -3,7 +3,7 @@ import * as vs from 'vscode';
 import { Model } from './model';
 import { GitService, GitBlameItem } from './gitService';
 import { Tracer } from './tracer';
-import { getTextEditor, getPullRequest } from './utils';
+import { debounce, getPullRequests, isEmptyHash } from './utils';
 
 const NotCommitted = `Not committed yet`;
 
@@ -18,21 +18,81 @@ class BlameViewStatProvider implements vs.Disposable, vs.HoverProvider {
   }
 
   provideHover(document: vs.TextDocument, position: vs.Position): vs.ProviderResult<vs.Hover> {
-    if (!this._owner.isAvailable(document, position)) {
+    if (!this._owner.shouldShowHover(document, position)) {
       return;
     }
-    let markdown = new vs.MarkdownString(`*\`Committed Files\`*\r\n>\r\n`);
-    markdown.appendCodeblock(this._owner.blame?.stat ?? '', 'txt');
+    let markdown = new vs.MarkdownString(
+      `*<span style="color:var(--vscode-githd-infoView-content);">Committed Files</span>*\r\n>\r\n`
+    );
+    markdown.appendCodeblock(this._owner.blame?.stat ?? '', 'typescript');
     markdown.appendMarkdown('>');
+    markdown.isTrusted = true;
     return new vs.Hover(markdown);
   }
 }
 
-export class BlameViewProvider implements vs.HoverProvider {
+class BlameViewInfoProvider implements vs.Disposable, vs.HoverProvider {
+  private _disposables: vs.Disposable[] = [];
+  constructor(private _owner: BlameViewProvider, private _gitService: GitService) {
+    this._disposables.push(vs.languages.registerHoverProvider({ scheme: 'file' }, this));
+  }
+
+  dispose(): void {
+    vs.Disposable.from(...this._disposables).dispose();
+  }
+
+  provideHover(document: vs.TextDocument, position: vs.Position): vs.ProviderResult<vs.Hover> {
+    if (!this._owner.shouldShowHover(document, position)) {
+      return;
+    }
+
+    const blame = this._owner.blame as GitBlameItem; // shouldShowHover will be false if _blame is undefined
+    return new Promise(async resolve => {
+      const repo = await this._gitService.getGitRepo(blame.file.fsPath);
+      const ref: string = blame.hash;
+      let args: string = encodeURIComponent(JSON.stringify([repo, ref, blame.file]));
+      const commit: string = `*[${ref}](command:githd.openCommit?${args} "Click to see commit details")*`;
+      args = encodeURIComponent(JSON.stringify([blame.file]));
+      const file: string = `[*file*](command:githd.viewFileHistory?${args} "Click to see current file history")`;
+      const line: string = `[*line*](command:githd.viewLineHistory?${args} "Click to see current line history")`;
+      let subject: string = '';
+      let lastPREnd = 0;
+
+      getPullRequests(blame.subject ?? '').forEach(([pr, start]) => {
+        subject += blame.subject?.substring(lastPREnd, start) + `[*${pr}*](${repo?.remoteUrl}/pull/${pr.substring(1)})`;
+        lastPREnd = start + pr.length;
+      });
+
+      subject += blame.subject?.substring(lastPREnd);
+      const email = blame.email?.replace('@', '\\@');
+
+      Tracer.verbose(`Blame view: ${commit}`);
+      const content: string = `
+${commit}
+*</span><span style="color:var(--vscode-githd-historyView-author);">${blame.author}</span>*
+*<span style="color:var(--vscode-githd-historyView-email);">${email}</span>*
+*(${blame.date})*
+&ensp;
+*(<span style="color:var(--vscode-githd-historyView-title);">history</span>: ${file} || ${line})*
+
+### ${subject}
+
+${blame.body}
+>`;
+
+      let markdown = new vs.MarkdownString(content);
+      markdown.isTrusted = true;
+      return resolve(new vs.Hover(markdown));
+    });
+  }
+}
+
+export class BlameViewProvider {
   private _blame: GitBlameItem | undefined;
+  private _infoProvider: BlameViewInfoProvider;
   private _statProvider: BlameViewStatProvider;
-  private _debouncing: NodeJS.Timer | undefined;
-  private _enabled = false;
+  private _debouncedUpdate: (editor: vs.TextEditor) => void;
+  private _blameViewMode: 'disabled' | 'blame' | 'detail' = 'disabled';
   private _decoration = vs.window.createTextEditorDecorationType({
     after: {
       color: new vs.ThemeColor('githd.blameView.info'),
@@ -40,11 +100,17 @@ export class BlameViewProvider implements vs.HoverProvider {
     }
   });
 
-  constructor(context: vs.ExtensionContext, model: Model, private _gitService: GitService) {
-    this.enabled = model.configuration.blameEnabled;
+  constructor(
+    context: vs.ExtensionContext,
+    model: Model,
+    private _gitService: GitService
+  ) {
+    this._blameViewMode = model.configuration.blameViewMode;
     this._statProvider = new BlameViewStatProvider(this);
+    this._infoProvider = new BlameViewInfoProvider(this, _gitService);
+    this._debouncedUpdate = debounce((editor: vs.TextEditor) => this._update(editor), 250);
     context.subscriptions.push(
-      vs.languages.registerHoverProvider({ scheme: 'file' }, this),
+      this._infoProvider,
       this._statProvider,
       this._decoration
     );
@@ -68,7 +134,7 @@ export class BlameViewProvider implements vs.HoverProvider {
 
     vs.workspace.onDidChangeTextDocument(
       e => {
-        this._onDidChangeTextDocument(getTextEditor(e.document));
+        this._onDidChangeTextDocument(e.document);
       },
       null,
       context.subscriptions
@@ -76,70 +142,25 @@ export class BlameViewProvider implements vs.HoverProvider {
 
     model.onDidChangeConfiguration(
       config => {
-        this.enabled = config.blameEnabled;
+        this._blameViewMode = config.blameViewMode;
       },
       null,
       context.subscriptions
     );
   }
 
-  private set enabled(value: boolean) {
-    if (this._enabled !== value) {
-      Tracer.info(`Blame view: set enabled ${value}`);
-      this._enabled = value;
-    }
+  private get _enabled(): boolean {
+    return this._blameViewMode !== 'disabled';
   }
 
   get blame(): GitBlameItem | undefined {
     return this._blame;
   }
 
-  provideHover(document: vs.TextDocument, position: vs.Position): vs.ProviderResult<vs.Hover> {
-    if (!this.isAvailable(document, position)) {
-      return;
-    }
-
-    const blame = this._blame;
-    if (!blame) {
-      return;
-    }
-
-    return new Promise(async resolve => {
-      const repo = await this._gitService.getGitRepo(blame.file.fsPath);
-      const ref: string = blame.hash;
-      const args: string = encodeURIComponent(JSON.stringify([repo, ref, blame.file]));
-      const cmd: string = `[*${ref}*](command:githd.openCommit?${args} "Click to see commit details")`;
-      let subject = blame.subject;
-      const [pr, start] = getPullRequest(blame.subject);
-      if (pr) {
-        subject =
-          subject.substring(0, start) +
-          `[*${pr}*](${repo?.remoteUrl}/pull/${pr.substring(1)})` +
-          subject.substring(start + pr.length);
-      }
-
-      Tracer.verbose(`Blame view: ${cmd}`);
-      const content: string = `
-${cmd}
-*\`${blame.author}\`*
-*\`${blame.email}\`*
-*\`(${blame.date})\`*
-
-${subject}
-
-${blame.body}
->`;
-
-      let markdown = new vs.MarkdownString(content);
-      markdown.isTrusted = true;
-      return resolve(new vs.Hover(markdown));
-    });
-  }
-
-  isAvailable(doc: vs.TextDocument, pos: vs.Position): boolean {
+  shouldShowHover(doc: vs.TextDocument, pos: vs.Position): boolean {
     if (
-      !this._enabled ||
-      !this._blame?.hash ||
+      this._blameViewMode === 'disabled' ||
+      isEmptyHash(this._blame?.hash) ||
       doc.isDirty ||
       pos.line != this._blame?.line ||
       pos.character < doc.lineAt(this._blame.line).range.end.character ||
@@ -147,7 +168,7 @@ ${blame.body}
     ) {
       return false;
     }
-    return true;
+    return this._blameViewMode === 'detail';
   }
 
   private async _onDidChangeSelection(editor: vs.TextEditor) {
@@ -163,10 +184,8 @@ ${blame.body}
 
     const line = editor.selection.active.line;
     if (!this._blame || line != this._blame.line || file !== this._blame.file) {
-      // this._blame = { file, line, stat: '' };
       this._clear(editor);
-      clearTimeout(this._debouncing);
-      this._debouncing = setTimeout(() => this._update(editor), 250);
+      this._debouncedUpdate(editor);
     }
   }
 
@@ -184,18 +203,16 @@ ${blame.body}
     this._update(editor);
   }
 
-  private async _onDidChangeTextDocument(editor?: vs.TextEditor) {
-    if (!editor) {
+  private async _onDidChangeTextDocument(doc: vs.TextDocument) {
+    const editor: vs.TextEditor | undefined = vs.window.activeTextEditor;
+    if (!this._enabled || doc.uri.scheme !== 'file' || editor?.document !== doc) {
       return;
     }
-    const file = editor.document.uri;
-    if (!this._enabled || file.scheme !== 'file') {
-      return;
-    }
-    Tracer.verbose(`Blame view: onDidChange.TextDocument. isDirty ${editor.document.isDirty}`);
+
+    Tracer.verbose(`Blame view: onDidChange.TextDocument. isDirty ${doc.isDirty}`);
 
     this._clear(editor);
-    if (!editor.document.isDirty) {
+    if (!doc.isDirty) {
       this._update(editor);
     }
   }
@@ -203,28 +220,29 @@ ${blame.body}
   private async _update(editor: vs.TextEditor): Promise<void> {
     const file = editor.document.uri;
     const line = editor.selection.active.line;
-    Tracer.verbose(`Try to update blame. ${file.fsPath}: ${line}`);
-    this._blame = await this._gitService.getBlameItem(file, line);
-    if (file !== editor.document.uri || line != editor.selection.active.line || editor.document.isDirty) {
-      // git blame could take long time and the active line has changed
-      Tracer.info(`This update is outdated. ${file.fsPath}: ${line}, dirty ${editor.document.isDirty}`);
-      this._blame = undefined;
-    }
+    Tracer.verbose(` Try to update blame. ${file.fsPath}: ${line}`);
 
+    this._blame = await this._gitService.getBlameItem(file, line);
     if (!this._blame) {
       return;
     }
 
     let contentText = '\u00a0\u00a0\u00a0\u00a0';
-    if (this._blame?.hash) {
-      contentText += `${this._blame.author} [${this._blame.relativeDate}]\u00a0\u2022\u00a0${this._blame.subject}`;
-    } else {
+    if (isEmptyHash(this._blame.hash)) {
       contentText += NotCommitted;
+    } else {
+      contentText += `${this._blame.author} [${this._blame.relativeDate}]\u00a0\u2022\u00a0${this._blame.subject}`;
     }
     const options: vs.DecorationOptions = {
       range: new vs.Range(line, Number.MAX_SAFE_INTEGER, line, Number.MAX_SAFE_INTEGER),
       renderOptions: { after: { contentText } }
     };
+    if (file !== editor.document.uri || line != editor.selection.active.line || editor.document.isDirty) {
+      // git blame could take long time and the active line has changed
+      Tracer.info(`This update is outdated. ${file.fsPath}: ${line}, dirty ${editor.document.isDirty}`);
+      this._blame = undefined;
+      return;
+    }
     editor.setDecorations(this._decoration, [options]);
   }
 

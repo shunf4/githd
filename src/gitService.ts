@@ -3,20 +3,20 @@ import * as fs from 'fs';
 import * as os from 'os';
 
 import * as vs from 'vscode';
-import { exec } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { Tracer } from './tracer';
+import { isEmptyHash } from './utils';
 
 const EntrySeparator = '[githd-es]';
 const FormatSeparator = '[githd-fs]';
-
-function formatDate(timestamp: number): string {
-  return new Date(timestamp * 1000).toDateString();
-}
 
 function normalizeFilePath(fsPath: string): string {
   fsPath = path.normalize(fsPath);
   if (os.platform() == 'win32') {
     fsPath = fsPath.toLocaleLowerCase();
+  }
+  if (!fsPath.endsWith(path.sep)) {
+    fsPath = fsPath + path.sep;
   }
   return fsPath;
 }
@@ -43,7 +43,9 @@ export interface GitLogEntry {
   ref: string;
   author: string;
   email: string;
+  timestamp: number;
   date: string;
+  relativeDate: string;
   stat?: string;
   lineInfo?: string;
 }
@@ -54,6 +56,7 @@ export interface GitCommittedFile {
   gitRelativePath: string;
   gitRelativeOldPath: string;
   status: string;
+  stat: string | undefined;
 }
 
 class GitCommittedFileImpl implements GitCommittedFile {
@@ -63,6 +66,8 @@ class GitCommittedFileImpl implements GitCommittedFile {
     readonly gitRelativeOldPath: string,
     readonly status: string
   ) {}
+
+  stat: string | undefined;
 
   get fileUri(): vs.Uri {
     return vs.Uri.file(path.join(this._repo.root, this.gitRelativePath));
@@ -77,13 +82,13 @@ export interface GitBlameItem {
   file: vs.Uri;
   line: number;
   hash: string;
-  subject: string;
-  body: string;
-  author: string;
-  date: string;
-  relativeDate: string;
-  email: string;
-  stat: string;
+  subject?: string;
+  body?: string;
+  author?: string;
+  date?: string;
+  relativeDate?: string;
+  email?: string;
+  stat?: string;
 }
 
 function singleLined(value: string): string {
@@ -93,35 +98,66 @@ function singleLined(value: string): string {
 export class GitService {
   private _gitRepos: GitRepo[] = [];
   private _onDidChangeGitRepositories = new vs.EventEmitter<GitRepo[]>();
-  private _gitPath: string = vs.workspace.getConfiguration('git').get('path') ?? 'git';
+  private _onDidChangeCurrentGitRepo = new vs.EventEmitter<GitRepo>();
+  private _gitPath: string;
+  private _currentRepo: GitRepo | undefined;
 
   constructor(context: vs.ExtensionContext) {
-    context.subscriptions.push(this._onDidChangeGitRepositories);
+    context.subscriptions.push(
+      vs.workspace.onDidChangeWorkspaceFolders(_ => this.updateGitRoots(vs.workspace.workspaceFolders)),
+      this._onDidChangeGitRepositories,
+      this._onDidChangeCurrentGitRepo
+    );
+    let gitPath: string = vs.workspace.getConfiguration('git').get('path') ?? '';
+    if (gitPath) {
+      try {
+        execSync(gitPath);
+      } catch (err) {
+        // fallback to 'git' without the path
+        gitPath = 'git';
+      }
+    } else {
+      gitPath = 'git';
+    }
+    this._gitPath = gitPath;
   }
 
   get onDidChangeGitRepositories(): vs.Event<GitRepo[]> {
     return this._onDidChangeGitRepositories.event;
   }
 
-  updateGitRoots(wsFolders: readonly vs.WorkspaceFolder[] | undefined) {
+  get onDidChangeCurrentGitRepo(): vs.Event<GitRepo> {
+    return this._onDidChangeCurrentGitRepo.event;
+  }
+
+  async updateGitRoots(wsFolders: readonly vs.WorkspaceFolder[] | undefined) {
     // reset repos first. Should optimize it to avoid firing multiple events.
     this._gitRepos = [];
-    vs.commands.executeCommand('setContext', 'hasGitRepo', false);
+    vs.commands.executeCommand('setContext', 'githd.hasGitRepo', false);
     this._onDidChangeGitRepositories.fire([]);
 
     const start = Date.now();
-    let count = 0;
-    if (wsFolders) {
-      wsFolders.forEach(wsFolder => {
-        count += this._scanFolder(wsFolder.uri.fsPath, true);
-      });
+    const promises: Promise<number>[] = wsFolders
+      ? wsFolders.map(wsFolder => this._scanFolder(wsFolder.uri.fsPath, true))
+      : [Promise.resolve(0)];
+    const count: number = await Promise.all(promises).then(results => results.reduce((a, b) => a + b, 0));
+    if (count === 1) {
+      this.updateCurrentGitRepo(this._gitRepos[0]);
     }
-
     Tracer.info(`updateGitRoots: ${wsFolders?.length} wsFolders ${count} subFolders (${Date.now() - start}ms)`);
   }
 
   getGitRepos(): GitRepo[] {
     return this._gitRepos;
+  }
+
+  get currentGitRepo(): GitRepo | undefined {
+    return this._currentRepo;
+  }
+
+  updateCurrentGitRepo(repo: GitRepo) {
+    this._currentRepo = repo;
+    this._onDidChangeCurrentGitRepo.fire(repo);
   }
 
   async getGitRepo(fsPath: string): Promise<GitRepo | undefined> {
@@ -144,7 +180,7 @@ export class GitService {
         const remoteUrl = await this._getRemoteUrl(fsPath);
         repo = { root, remoteUrl };
         this._gitRepos.push(repo);
-        vs.commands.executeCommand('setContext', 'hasGitRepo', true);
+        vs.commands.executeCommand('setContext', 'githd.hasGitRepo', true);
         this._onDidChangeGitRepositories.fire(this.getGitRepos());
       }
     }
@@ -170,7 +206,13 @@ export class GitService {
     return (await this._exec(['rev-parse', '--abbrev-ref', 'HEAD'], repo.root)).trim();
   }
 
-  async getCommitsCount(repo: GitRepo, branch: string, author?: string, fileUri?: vs.Uri): Promise<number> {
+  async getCommitsCount(
+    repo: GitRepo,
+    branch: string,
+    author?: string,
+    startTime?: Date,
+    endTime?: Date
+  , fileUri?: vs.Uri): Promise<number> {
     if (!repo) {
       return 0;
     }
@@ -178,6 +220,16 @@ export class GitService {
     if (author) {
       args.push(`--author=${author}`);
     }
+    if (startTime) {
+      args.push(`--after=${startTime.toISOString()}`);
+    }
+    if (endTime) {
+      args.push(`--before=${endTime.toISOString()}`);
+    }
+
+    // the '--' is to avoid same branch and file names caused error
+    args.push('--');
+
     if (fileUri) {
       const gitRelFilePath = (await this.getGitRelativePath(fileUri)) ?? '.';
       // --follow seems not respect --skip=N. Now that we limit log entries for file history...
@@ -191,7 +243,7 @@ export class GitService {
     if (!repo) {
       return [];
     }
-    const result = await this._exec(['for-each-ref', '--format="%(refname) %(objectname:short)"'], repo.root);
+    const result = await this._exec(['for-each-ref', '--format=%(refname) %(objectname:short)'], repo.root);
     const fn = (line: string): GitRef | null => {
       let match: RegExpExecArray | null;
 
@@ -218,14 +270,15 @@ export class GitService {
       .filter(ref => !!ref) as GitRef[];
   }
 
+  // returns [total commits stats, [commits]]
   async getCommittedFiles(
     repo: GitRepo,
     rightRef: string,
     leftRef?: string,
     isStash?: boolean
-  ): Promise<GitCommittedFile[]> {
+  ): Promise<[string, GitCommittedFile[]]> {
     if (!repo) {
-      return [];
+      return ['', []];
     }
     let args = ['show', '--format=%h', '--name-status', rightRef];
     if (leftRef) {
@@ -253,6 +306,7 @@ export class GitService {
           case 'M':
           case 'A':
           case 'D':
+          case 'T':
             gitRelativeOldPath = info[1];
             gitRelativePath = info[1];
             break;
@@ -267,7 +321,8 @@ export class GitService {
         files.push(new GitCommittedFileImpl(repo, gitRelativePath, gitRelativeOldPath, status));
       }
     });
-    return files;
+    const stats: string = !leftRef && !isStash ? await this._updateCommitsStats(repo, rightRef, files) : '';
+    return [stats, files];
   }
 
   async getLogEntries(
@@ -279,11 +334,14 @@ export class GitService {
     isStash?: boolean,
     file?: vs.Uri,
     line?: number,
-    author?: string
+    author?: string,
+    startTime?: Date,
+    endTime?: Date
   ): Promise<GitLogEntry[]> {
     Tracer.info(
       `Get entries. repo: ${repo.root}, express: ${express}, start: ${start}, count: ${count}, branch: ${branch}, ` +
-        `isStash: ${isStash}, file: ${file?.fsPath}, line: ${line}, author: ${author}`
+        `isStash: ${isStash}, file: ${file?.fsPath}, line: ${line}, author: ${author}, ` +
+        `startTime: ${startTime?.toISOString()}, endTime: ${endTime?.toISOString()}`
     );
     if (!repo) {
       return [];
@@ -292,27 +350,51 @@ export class GitService {
     if (isStash) {
       format += '%gd:';
     }
-    format += `%s${FormatSeparator}%h${FormatSeparator}%d${FormatSeparator}%aN${FormatSeparator}%ae${FormatSeparator}%ct${FormatSeparator}%cr${FormatSeparator}`;
-    let args: string[] = [`--format="${format}"`];
+
+    enum logItem {
+      subject,
+      hash,
+      ref,
+      author,
+      email,
+      timestamp,
+      date,
+      relativeDate,
+      additional,
+      total
+    }
+
+    format += `%s${FormatSeparator}%h${FormatSeparator}%d${FormatSeparator}%aN${FormatSeparator}%ae${FormatSeparator}%ct${FormatSeparator}%cd${FormatSeparator}%cr${FormatSeparator}`;
+    let args: string[] = [`--format=${format}`, '--date=local'];
     if (!express && !line) {
       args.push('--shortstat');
     }
     if (isStash) {
       args.unshift('stash', 'list');
     } else {
-      args.unshift('log', `--skip=${start}`, `--max-count=${count}`, '--simplify-merges', branch);
+      args.unshift('log', `--skip=${start}`, `--max-count=${count}`, '--date-order', '--simplify-merges', branch);
       if (author) {
         args.push(`--author=${author}`);
       }
+      if (startTime) {
+        args.push(`--after=${startTime.toISOString()}`);
+      }
+      if (endTime) {
+        args.push(`--before=${endTime.toISOString()}`);
+      }
+
       if (file) {
         const filePath = (await this.getGitRelativePath(file)) ?? '.';
         if (line) {
-          args.push(`-L ${line},${line}:${filePath}`);
+          args.push(`-L ${line},${line}:${filePath}`, '--');
         } else {
           // --follow seems not respect --skip=N. Now that we limit log entries for file history...
-          // args.push('--follow', filePath);
+          // args.push('--follow', '--', filePath);
           args.push(filePath);
         }
+      } else {
+        // the '--' is to avoid same branch and file names caused error
+        args.push('--');
       }
     }
 
@@ -328,33 +410,38 @@ export class GitService {
       let ref: string;
       let author: string;
       let email: string;
+      let timestamp: number;
       let date: string;
+      let relativeDate: string;
       let stat: string;
       let lineInfo: string;
       entry.split(FormatSeparator).forEach((value, index) => {
-        switch (index % 8) {
-          case 0:
+        switch (index % logItem.total) {
+          case logItem.subject:
             subject = singleLined(value);
             break;
-          case 1:
+          case logItem.hash:
             hash = value;
             break;
-          case 2:
+          case logItem.ref:
             ref = value;
             break;
-          case 3:
+          case logItem.author:
             author = value;
             break;
-          case 4:
+          case logItem.email:
             email = value;
             break;
-          case 5:
-            date = formatDate(parseInt(value));
+          case logItem.timestamp:
+            timestamp = parseInt(value);
             break;
-          case 6:
-            date += ` (${value})`;
+          case logItem.date:
+            date = value;
             break;
-          case 7:
+          case logItem.relativeDate:
+            relativeDate = value;
+            break;
+          case logItem.additional:
             if (!!line) {
               lineInfo = value.trim();
             } else {
@@ -366,7 +453,9 @@ export class GitService {
               ref,
               author,
               email,
+              timestamp,
               date,
+              relativeDate,
               stat,
               lineInfo
             });
@@ -386,7 +475,7 @@ export class GitService {
       ? `Stash:         %H %nAuthor:        %aN <%aE> %nAuthorDate:    %ad %n%n%s %n`
       : 'Commit:        %H %nAuthor:        %aN <%aE> %nAuthorDate:    %ad %nCommit:        %cN <%cE> %nCommitDate:    %cd %n%n%s %n';
     let details: string = await this._exec(
-      ['show', `--format="${format}"`, '--no-patch', '--date=local', ref],
+      ['show', `--format=${format}`, '--no-patch', '--date=local', ref],
       repo.root
     );
     const body = (await this._exec(['show', '--format=%b', '--no-patch', ref], repo.root)).trim();
@@ -394,7 +483,7 @@ export class GitService {
       details += body + '\r\n\r\n';
     }
     details += '-----------------------------\r\n\r\n';
-    details += await this._exec(['show', '--format=', '--stat', ref], repo.root);
+    details += await this._exec(['show', '--format=', '--stat', '--stat-width=120', ref], repo.root);
     return details;
   }
 
@@ -406,7 +495,7 @@ export class GitService {
     return result.split(/\r?\n/g).map(item => {
       item = item.trim();
       let start: number = item.search(/ |\t/);
-      item = item.substr(start + 1).trim();
+      item = item.substring(start + 1).trim();
       start = item.indexOf('<');
 
       const name: string = item.substring(0, start);
@@ -436,7 +525,7 @@ export class GitService {
         hash = line.split(' ')[0];
       } else {
         const infoName = line.split(' ')[0];
-        const info = line.substr(infoName.length).trim();
+        const info = line.substring(infoName.length).trim();
         if (!info) {
           return;
         }
@@ -466,6 +555,11 @@ export class GitService {
       return;
     }
 
+    if (isEmptyHash(hash)) {
+      Tracer.verbose(`Blame info skipped. repo ${repo.root} file ${filePath}:${line} ${hash}`);
+      return { file, line, hash };
+    }
+
     // get additional info: abbrev hash, relative date, body, stat
     const addition: string = await this._exec(
       ['show', `--format=%h${FormatSeparator}%cr${FormatSeparator}%b${FormatSeparator}`, '--stat', `${hash}`],
@@ -476,7 +570,7 @@ export class GitService {
     hash = items[0] ?? '';
     const relativeDate = items[1] ?? '';
     const body = items[2]?.trim() ?? '';
-    const stat = ' ' + items[3]?.trim() ?? '';
+    const stat = ' ' + items[3]?.trim();
     return {
       file,
       line,
@@ -491,69 +585,109 @@ export class GitService {
     };
   }
 
-  private _scanFolder(folder: string, includeSubFolders?: boolean): number {
-    let count = 0;
+  // commits will be updated with stats
+  private async _updateCommitsStats(repo: GitRepo, ref: string, commits: GitCommittedFile[]): Promise<string> {
+    const res: string = await this._exec(['show', '--format=', '--stat', '--stat-width=200', ref], repo.root);
+    const stats = new Map<string, string>(); // [oldFilePath, stat]
+    let total = '';
+    res.split(/\r?\n/g).forEach(line => {
+      const items = line.split('|');
+      if (items.length == 2) {
+        stats.set(items[0].trim(), items[1].trim()); // TODO: rename is not handled
+      } else if (line.indexOf('changed') > 0) {
+        total = line;
+      }
+    });
+
+    commits.forEach(commit => (commit.stat = stats.get(commit.gitRelativeOldPath)));
+    return total;
+  }
+
+  async getCommits(repo: GitRepo, branch?: string): Promise<string[]> {
+    if (!branch) {
+      return [];
+    }
+
+    const result: string = await this._exec(
+      ['log', '--format=%h', '--simplify-merges', '--date-order', branch, '--'],
+      repo.root
+    );
+    return result.split(/\r?\n/g);
+  }
+
+  private async _scanFolder(folder: string, includeSubFolders?: boolean): Promise<number> {
     const children = fs.readdirSync(folder, { withFileTypes: true });
-    children
-      .filter(child => child.isDirectory())
-      .forEach(async child => {
+    const promises = children
+      .filter(child => child.isDirectory() || child.isFile())
+      .map(async child => {
         if (child.name === '.git') {
-          this.getGitRepo(folder);
-          count++;
-        } else if (includeSubFolders) {
-          count += this._scanFolder(path.join(folder, child.name));
+          await this.getGitRepo(folder);
+          return 1;
         }
+        if (includeSubFolders && child.isDirectory()) {
+          return await this._scanFolder(path.join(folder, child.name));
+        }
+        return 0;
       });
-    return count;
+    return await Promise.all(promises).then(results => results.reduce((a, b) => a + b, 0));
   }
 
   private async _getRemoteUrl(fsPath: string): Promise<string> {
-    let url;
-
-    try {
-      let headSymbolicRef = (await this._exec(['symbolic-ref', '-q', 'HEAD'], fsPath)).trim();
-      if (headSymbolicRef == '') {
-        throw '';
-      }
-
-      let remote = (await this._exec(['for-each-ref', '--format="%(upstream:remotename)"', headSymbolicRef], fsPath)).trim();
-      if (headSymbolicRef == '') {
-        throw '';
-      }
-
-      url = (await this._exec(['remote', 'get-url', '--push', remote], fsPath)).trim();
-    } catch (e) {
-      url = '';
+    let remotes = (await this._exec(['remote'], fsPath)).split(/\r?\n/g);
+    const remote = remotes.find(r => r === 'upstream') || remotes.find(r => r === 'origin');
+    if (!remote) {
+      return '';
     }
 
-    if (url.startsWith('git@')) {
-      url = url.replace(':', '/').replace('git@', 'https://');
+    let remoteGit = (await this._exec(['remote', 'get-url', '--push', remote], fsPath)).trim();
+    if (remoteGit.startsWith('git@')) {
+      remoteGit = remoteGit.replace(':', '/').replace('git@', 'https://');
     }
-    url = url.replace(/\.git$/g, '');
+    let url = remoteGit.replace(/\.git$/g, '');
     // Do a best guess if it's a valid git repository url. In case user configs
     // the host name.
     if (url.search(/\.(com|org|net|io|cloud)\//g) > 0) {
       return url;
     }
 
-    Tracer.info('Remote URL: ' + url);
+    Tracer.info('Remote URL: ' + remoteGit);
     // If it's not considered as a valid one, we try to compose a github one.
     return url.replace(/:\/\/.*?\//g, '://github.com/');
   }
 
   private async _exec(args: string[], cwd: string): Promise<string> {
     const start = Date.now();
-    const cmd = this._gitPath + ' ' + args.join(' ');
-    return new Promise((resolve, reject) => {
-      exec(cmd, { encoding: 'utf8', cwd }, (err, stdout) => {
-        if (err) {
-          Tracer.error(`git command failed: ${cmd} (${Date.now() - start}ms) ${cwd} ${err.message}`);
-          reject(err);
-        } else {
-          Tracer.verbose(`git command: ${cmd}. Output size: ${stdout.length} (${Date.now() - start}ms) ${cwd}`);
-          resolve(stdout);
-        }
+    const cmd = this._gitPath;
+
+    try {
+      const result = await new Promise<string>((resolve, reject) => {
+        const childProcess = spawn(cmd, args, { cwd });
+        childProcess.stdout.setEncoding('utf8');
+        childProcess.stderr.setEncoding('utf8');
+        let stdout = '',
+          stderr = '';
+        childProcess.stdout.on('data', chunk => {
+          stdout += chunk;
+        });
+        childProcess.stderr.on('data', chunk => {
+          stderr += chunk;
+        });
+        childProcess.on('error', reject).on('close', code => {
+          if (code === 0) {
+            resolve(stdout);
+          } else {
+            reject(stderr);
+          }
+        });
       });
-    });
+
+      Tracer.verbose(
+        `git command: ${cmd} ${args.join(' ')}. Output size: ${result.length} (${Date.now() - start}ms) ${cwd}`
+      );
+      return result;
+    } catch (err) {
+      Tracer.error(`git command failed: ${cmd} ${args.join(' ')} (${Date.now() - start}ms) ${cwd} ${err}`);
+      return '';
+    }
   }
 }

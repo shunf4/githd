@@ -1,5 +1,4 @@
 import * as path from 'path';
-import * as assert from 'assert';
 
 import * as vs from 'vscode';
 
@@ -8,7 +7,9 @@ import { HistoryViewProvider } from './historyViewProvider';
 import { InfoViewProvider } from './infoViewProvider';
 import { GitService, GitRepo, GitRefType, GitCommittedFile } from './gitService';
 import { Tracer } from './tracer';
-import { resolve } from 'path';
+import { ExplorerViewProvider } from './explorerViewProvider';
+import { Dataloader } from './dataloader';
+import { PanelViewProvider } from './panelViewProvider';
 
 function toGitUri(uri: vs.Uri, ref?: string): vs.Uri {
   return uri.with({
@@ -124,29 +125,29 @@ export class CommandCenter {
   constructor(
     context: vs.ExtensionContext,
     private _model: Model,
+    private _loader: Dataloader,
     private _gitService: GitService,
     private _historyView: HistoryViewProvider,
-    private _infoView: InfoViewProvider
+    private _explorerView: ExplorerViewProvider
   ) {
+    // register an empty document content provider
+    vs.workspace.registerTextDocumentContentProvider('githd-empty', {
+      provideTextDocumentContent: () => ''
+    });
+
     context.subscriptions.push(
       ...Commands.map(({ id, method }) => {
-        return vs.commands.registerCommand(id, (...args: any[]) => {
-          Promise.resolve(method.apply(this, args));
-        });
+        return vs.commands.registerCommand(id, (...args: any[]) =>
+          Promise.resolve(method.apply(this, args)).catch(err => Tracer.error(`command ${id} failed ${err.message}`))
+        );
       })
     );
-  }
-
-  @command('githd.clear')
-  async clear(): Promise<void> {
-    Tracer.verbose('Command: githd.clear');
-    this._model.filesViewContext = undefined;
   }
 
   @command('githd.viewHistory')
   async viewHistory(): Promise<void> {
     Tracer.verbose('Command: githd.viewHistory');
-    const repo = await selectGitRepo(this._gitService);
+    const repo = await this._getOrUpdateRepo();
     if (repo) {
       this._viewHistory({ repo, branch: '' });
     }
@@ -193,11 +194,15 @@ export class CommandCenter {
   @command('githd.viewAllHistory')
   async viewAllHistory(): Promise<void> {
     Tracer.verbose('Command: githd.viewAllHistory');
-    let context = this._model.historyViewContext ?? {
-      repo: this._gitService.getGitRepos()[0],
-      branch: ''
-    };
-    return this._viewHistory(context, true);
+    if (this._model.historyViewContext) {
+      return this._viewHistory(this._model.historyViewContext, true);
+    }
+
+    const selected = await this._getOrUpdateRepo();
+    if (!selected) {
+      return;
+    }
+    this._model.setHistoryViewContext({ repo: selected, branch: '' });
   }
 
   @command('githd.viewBranchHistory')
@@ -212,7 +217,7 @@ export class CommandCenter {
         placeHolder += ` of ${path.basename(specifiedPath.fsPath)}`;
       }
     } else {
-      const selected = await selectGitRepo(this._gitService);
+      const selected = await this._getOrUpdateRepo();
       if (!selected) {
         return;
       }
@@ -233,10 +238,9 @@ export class CommandCenter {
   }
 
   @command('githd.viewAuthorHistory')
-  async viewAuthorHistory(): Promise<void> {
+  viewAuthorHistory(): void {
     Tracer.verbose('Command: githd.viewAuthorHistory');
-    assert(this._model.historyViewContext, 'history view context should exist');
-    const context: HistoryViewContext = this._model.historyViewContext;
+    const context = this._model.historyViewContext as HistoryViewContext;
     let placeHolder: string = `Select a author to see his/her commits`;
     vs.window
       .showQuickPick(selectAuthor(this._gitService, context.repo), {
@@ -257,7 +261,7 @@ export class CommandCenter {
   @command('githd.viewStashes')
   async viewStashes(): Promise<void> {
     Tracer.verbose('Command: githd.viewStashes');
-    const repo = await selectGitRepo(this._gitService);
+    const repo = await this._getOrUpdateRepo();
     if (repo) {
       this._viewHistory({ repo, isStash: true, branch: '' });
     }
@@ -266,29 +270,31 @@ export class CommandCenter {
   @command('githd.diffBranch')
   async diffBranch(): Promise<void> {
     Tracer.verbose('Command: githd.diffBranch');
-    const repo = await selectGitRepo(this._gitService);
+    const repo = await this._getOrUpdateRepo();
     if (!repo) {
       return;
     }
-    this._diffSelections({ repo });
+    this._diffSelections(repo);
   }
 
   @command('githd.diffFile')
-  async diffFile(specifiedPath: vs.Uri): Promise<void> {
+  // explorer/context will pass two args while editor/context will one
+  async diffFile(specifiedPath: vs.Uri, _: any, ref?: string): Promise<void> {
     Tracer.verbose('Command: githd.diffFile');
-    return this._diffPath(specifiedPath);
+    return this._diffPath(specifiedPath, ref);
   }
 
   @command('githd.diffFolder')
-  async diffFolder(specifiedPath: vs.Uri): Promise<void> {
+  // explorer/context will pass two args while editor/context will one
+  async diffFolder(specifiedPath: vs.Uri, _: any, ref?: string): Promise<void> {
     Tracer.verbose('Command: githd.diffFolder');
-    return this._diffPath(specifiedPath);
+    return this._diffPath(specifiedPath, ref);
   }
 
   @command('githd.inputRef')
   async inputRef(): Promise<void> {
     Tracer.verbose('Command: githd.inputRef');
-    const repo = await selectGitRepo(this._gitService);
+    const repo = await this._getOrUpdateRepo();
     if (!repo) {
       return;
     }
@@ -296,17 +302,69 @@ export class CommandCenter {
       .showInputBox({
         placeHolder: `Input a ref(sha1) to see it's committed files`
       })
-      .then(ref => (this._model.filesViewContext = { rightRef: ref?.trim(), repo }));
+      .then(ref => this._model.setFilesViewContext({ rightRef: ref?.trim(), repo }));
   }
 
   @command('githd.openCommit')
-  async openCommit(repo: GitRepo, ref: string, specifiedPath: vs.Uri): Promise<void> {
+  openCommit(repo: GitRepo, ref: string, specifiedPath: vs.Uri): void {
     Tracer.verbose('Command: githd.openCommit');
-    this._model.filesViewContext = { rightRef: ref, repo, specifiedPath };
+    this._model.setFilesViewContext({ rightRef: ref, repo, specifiedPath });
   }
 
+  @command('githd.goBackHistoryView')
+  goBackHistoryView(): void {
+    Tracer.verbose('Command: githd.goBackHistoryView');
+    this._model.goBackHistoryViewContext();
+  }
+
+  @command('githd.goForwardHistoryView')
+  goForwardHistoryView(): void {
+    Tracer.verbose('Command: githd.goForwardHistoryView');
+    this._model.goForwardHistoryViewContext();
+  }
+
+  @command('githd.goBackFilesView')
+  goBackFilesViewContext(): void {
+    this._model.goBackFilesViewContext();
+  }
+
+  @command('githd.goForwardFilesView')
+  goForwardFilesViewContext(): void {
+    this._model.goForwardFilesViewContext();
+  }
+
+  @command('githd.refreshFilesView')
+  async refreshFilesView(): Promise<void> {
+    Tracer.verbose('Command: githd.refreshFilesView');
+    await this._explorerView.refresh();
+  }
+
+  @command('githd.goBackNoMore')
+  dummyForGoBackIcon(): void {}
+
+  @command('githd.goForwardNoMore')
+  dummyForGoForwardIcon(): void {}
+
+  @command('githd.previousCommit')
+  async previousCommit(): Promise<void> {
+    Tracer.verbose('Command: githd.previousCommit');
+    this._explorerView.showPreviousCommit();
+  }
+
+  @command('githd.nextCommit')
+  async nextCommit(): Promise<void> {
+    Tracer.verbose('Command: githd.nextCommit');
+    this._explorerView.showNextCommit();
+  }
+
+  @command('githd.previousCommitNoMore')
+  dummyForPreviousCommitIcon(): void {}
+
+  @command('githd.nextCommitNoMore')
+  dummyForNextCommitIcon(): void {}
+
   @command('githd.openCommittedFile')
-  async openCommittedFile(file: GitCommittedFile): Promise<void> {
+  openCommittedFile(file: GitCommittedFile): void {
     Tracer.verbose('Command: githd.openCommittedFile');
     let rightRef = this._model.filesViewContext?.rightRef;
     let leftRef: string = rightRef + '~';
@@ -315,21 +373,28 @@ export class CommandCenter {
       leftRef = this._model.filesViewContext.leftRef;
       title = `${leftRef} .. ${rightRef}`;
     }
-    vs.commands.executeCommand<void>(
-      'vscode.diff',
-      toGitUri(file.oldFileUri, leftRef),
-      toGitUri(file.fileUri, rightRef),
-      title + ' | ' + path.basename(file.gitRelativePath),
-      { preview: true }
-    );
+    title += ' | ' + path.basename(file.gitRelativePath);
+    let left = file.status == 'A' ? vs.Uri.parse('githd-empty:') : toGitUri(file.oldFileUri, leftRef);
+    let right = file.status == 'D' ? vs.Uri.parse('githd-empty:') : toGitUri(file.fileUri, rightRef);
+    vs.commands.executeCommand<void>('vscode.diff', left, right, title, { preview: true });
   }
 
   @command('githd.openCommitInfo')
-  async openCommitInfo(content: string): Promise<void> {
+  openCommitInfo(): void {
     Tracer.verbose('Command: githd.openCommitInfo');
-    this._infoView.update(content);
+    vs.workspace.openTextDocument(InfoViewProvider.defaultUri).then(doc => {
+      vs.languages.setTextDocumentLanguage(doc, 'githd');
+      vs.window
+        .showTextDocument(doc, { preview: true, preserveFocus: true })
+        .then(() => vs.commands.executeCommand('cursorTop'));
+    });
+  }
+
+  @command('githd.openLineDiff')
+  openLineDiff(content: string): void {
+    Tracer.verbose('Command: githd.openLineDiff');
     vs.workspace
-      .openTextDocument(InfoViewProvider.defaultUri)
+      .openTextDocument({ content, language: 'diff' })
       .then(doc =>
         vs.window
           .showTextDocument(doc, { preview: true, preserveFocus: true })
@@ -371,35 +436,57 @@ export class CommandCenter {
     this._historyView.express = !this._historyView.express;
   }
 
+  @command('githd.setRepository')
+  async setRepository(): Promise<void> {
+    Tracer.verbose('Command: githd.setRepository');
+
+    const repo: GitRepo | undefined = await selectGitRepo(this._gitService);
+    if (repo) {
+      this._gitService.updateCurrentGitRepo(repo);
+    }
+  }
+
+  @command('githd.clearFilesView')
+  clearFilesView(): void {
+    Tracer.verbose('Command: githd.clearFilesView');
+    this._model.clearFilesViewContexts();
+  }
+
+  @command('githd.showStats')
+  showStats(): void {
+    Tracer.verbose('Command: githd.showStats');
+    vs.commands.executeCommand(`${PanelViewProvider.viewType}.focus`);
+  }
+
   private async _viewHistory(context: HistoryViewContext, all: boolean = false): Promise<void> {
     this._historyView.loadAll = all;
     await this._model.setHistoryViewContext(context);
   }
 
-  private async _diffPath(specifiedPath: vs.Uri): Promise<void> {
+  private async _diffPath(specifiedPath: vs.Uri, ref?: string): Promise<void> {
     if (specifiedPath) {
       const repo = await this._gitService.getGitRepo(specifiedPath.fsPath);
       if (repo) {
-        this._diffSelections({ repo, specifiedPath });
+        this._diffSelections(repo, specifiedPath, ref);
       }
     }
   }
 
-  private async _diffSelections({ repo, specifiedPath }: { repo: GitRepo; specifiedPath?: vs.Uri }): Promise<void> {
+  private async _diffSelections(repo: GitRepo, specifiedPath?: vs.Uri, ref?: string): Promise<void> {
     const branches = await selectBranch(this._gitService, repo, true);
     const branchWithCombination = await branchCombination(this._gitService, repo);
     const items = [...branches, ...branchWithCombination];
-    const currentRef = await this._gitService.getCurrentBranch(repo);
-    const placeHolder: string = `Select a ref to see it's diff with ${currentRef} or select two refs to see their diffs`;
+    ref = ref || (await this._loader.getCurrentBranch(repo));
+    const placeHolder: string = `Select a ref to see it's diff with ${ref} or select two refs to see their diffs`;
     vs.window.showQuickPick(items, { placeHolder: placeHolder }).then(async item => {
       if (!item) {
         return;
       }
       let leftRef = await getRefFromQuickPickItem(
         item,
-        `Input a ref(sha1) to compare with ${currentRef} or ` + `'ref(sha1) .. ref(sha2)' to compare with two commits`
+        `Input a ref(sha1) to compare with ${ref} or ` + `'ref(sha1) .. ref(sha2)' to compare with two commits`
       );
-      let rightRef = currentRef;
+      let rightRef = ref;
       if (!leftRef) {
         return;
       }
@@ -410,12 +497,23 @@ export class CommandCenter {
         rightRef = diffBranch[1].trim();
       }
 
-      this._model.filesViewContext = {
+      this._model.setFilesViewContext({
         repo,
         leftRef,
         rightRef,
         specifiedPath
-      };
+      });
     });
+  }
+
+  private async _getOrUpdateRepo(): Promise<GitRepo | undefined> {
+    if (!this._gitService.currentGitRepo) {
+      const repo: GitRepo | undefined = await selectGitRepo(this._gitService);
+      if (!repo) {
+        return;
+      }
+      this._gitService.updateCurrentGitRepo(repo);
+    }
+    return this._gitService.currentGitRepo;
   }
 }

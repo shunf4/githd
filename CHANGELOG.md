@@ -1,12 +1,93 @@
 # Change Log
 
+## 2.5.7
+
+- Add refresh to files view.
+- Update blame view configuration.
+
+## 2.5.6
+
+- Bug fixes.
+
+## 2.5.5
+
+- Bug fixes.
+
+## 2.5.4
+
+- Bug fixes.
+
+## 2.5.3
+
+- Bug fixes.
+
+## 2.5.2
+
+- Bug fixes.
+
+## 2.5.1
+
+- Bug fixes.
+
+## 2.5.0
+
+- Add stats chart.
+- Use esbuild to reduce the extension package size.
+
+## 2.4.4
+
+- Downgrade vscode package to 1.91
+
+## 2.4.3
+
+- Upgrade vscode package to 1.93
+
+## 2.4.2
+
+- Color blame details.
+- Load more commits in the subsequent pages.
+- Bug fixes.
+
+## 2.4.1
+
+- Add a file icon for githd files.
+- Some tree view UI adjustments.
+- Bug fixes for cache.
+
+## 2.4.0
+
+- Go back or forward on History view.
+- Go back or forward on Explorer view.
+- Check the previous (older) or next (newer) commit.
+- Go to github PR links from blame view and commit info.
+
+## 2.3.8
+
+- Bug fixes.
+
+## 2.3.7
+
+- Bug fixes.
+
+## 2.3.6
+
+- Bug fixes.
+
+## 2.3.5
+
+- Bug fixes.
+
+## 2.3.4
+
+- Fix git 2.44 breaking changes.
+
 ## 2.3.3
 
-- Bug fix.
+- Bug fixes.
 
 ## 2.3.2
 
-- Bug fix.
+- Bug fixes.
 
 ## 2.3.1
 
