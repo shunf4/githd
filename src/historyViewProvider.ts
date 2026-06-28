@@ -17,7 +17,7 @@ const stashTitleLabel = 'Git Stashes';
 const titleLabel = 'Git History';
 const moreLabel = '\u00b7\u00b7\u00b7';
 const separatorLabel = '--------------------------------------------------------------';
-const loadingContent = ' ';
+const loadingContent = 'Loading...';
 
 const branchHoverMessage = new vs.MarkdownString('Select a branch to see its history');
 const authorHoverMessage = new vs.MarkdownString('Select an author to see the commits');
@@ -390,6 +390,7 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
         loadingCount = 10000; // Display at most 10k commits
       } else {
         if (this._totalCommitsCount == 0) {
+          Tracer.verbose('getCommitsCount');
           this._totalCommitsCount = await this._loader.getCommitsCount(
             context.repo,
             context.branch,
@@ -397,6 +398,9 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
             context.startTime,
             context.endTime
           );
+          Tracer.verbose(`commitCount ${this._totalCommitsCount}`);
+          Tracer.verbose(`this._loadedCount ${this._loadedCount}`);
+          Tracer.verbose(`this._commitsCount ${this._commitsCount}`);
         }
 
         // pageSize is the total count includes multiple loadings
@@ -406,7 +410,12 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
         } else if (loadMore) {
           pageSize = Math.min(2 * this._loadedCount, maxPageSize);
         }
+        Tracer.verbose(`pageSize ${pageSize}`);
+        Tracer.verbose(`loadingCount ${loadingCount}`);
+        Tracer.verbose(`this._loadAll ${this._loadAll}`);
+        Tracer.verbose(`firstLoadingCount ${firstLoadingCount}`);
         this._leftCount = Math.max(0, pageSize - loadingCount);
+        Tracer.verbose(`this._leftCount ${this._leftCount}`);
       }
     } else {
       loadingCount = Math.min(this._leftCount, maxSingleLoadingCount);
@@ -660,7 +669,9 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
 
     if (this._content === loadingContent) {
       Tracer.verbose('HistoryView: _loadingDecoration used');
-      editor.setDecorations(this._loadingDecoration, [new vs.Range(0, 0, 0, 1)]);
+      editor.setDecorations(this._loadingDecoration, [
+        new vs.Range(0, loadingContent.length, 0, loadingContent.length)
+      ]);
       return;
     }
 
