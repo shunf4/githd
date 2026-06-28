@@ -15,7 +15,7 @@ const maxPageSize = 10000;
 
 const stashTitleLabel = 'Git Stashes';
 const titleLabel = 'Git History';
-const moreLabel = '···';
+const moreLabel = '\u00b7\u00b7\u00b7';
 const separatorLabel = '--------------------------------------------------------------';
 const loadingContent = ' ';
 

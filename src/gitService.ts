@@ -390,7 +390,7 @@ export class GitService {
         } else {
           // --follow seems not respect --skip=N. Now that we limit log entries for file history...
           // args.push('--follow', '--', filePath);
-          args.push(filePath);
+          args.push('--', filePath);
         }
       } else {
         // the '--' is to avoid same branch and file names caused error
