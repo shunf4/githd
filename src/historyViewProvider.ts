@@ -122,13 +122,22 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
     this._model.onDidChangeHistoryViewContext(context => {
       Tracer.verbose(`HistoryView: onDidChangeHistoryViewContext`);
       vs.workspace.openTextDocument(HistoryViewProvider.defaultUri).then(async doc => {
-        vs.window.showTextDocument(doc, {
+        await vs.window.showTextDocument(doc, {
           preview: false,
           preserveFocus: true
         });
         this._loadMoreClicked = false;
         await this._updateContent(false);
-        this._moveToTop(getHistoryViewEditor());
+        // Reopening the same virtual document can reuse a cached model whose
+        // final content equals what was shown before. In that case VS Code does
+        // not fire onDidChangeTextDocument, so the decorations/top-scroll that
+        // normally happen there would be skipped. Apply them explicitly here.
+        this._updating = false;
+        const editor = getHistoryViewEditor();
+        if (editor) {
+          this._setDecorations(editor);
+          this._moveToTop(editor);
+        }
       });
     });
 
@@ -177,6 +186,13 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
       if (doc.uri.scheme === HistoryViewProvider.scheme) {
         Tracer.verbose('HistoryView: onDidCloseTextDocument');
         this._reset();
+        // Reset the pagination/loading state too, otherwise reopening the same
+        // history view carries over stale _leftCount/_updating flags from the
+        // previous session and the view gets stuck on "Loading...".
+        this._leftCount = 0;
+        this._totalCommitsCount = 0;
+        this._loadMoreClicked = false;
+        this._updating = false;
       }
     });
 
@@ -384,11 +400,19 @@ export class HistoryViewProvider implements vs.TextDocumentContentProvider {
     }
 
     this._content = contentBackup + content;
+    // Always fire so the document reflects the final content. Previously this
+    // short-circuited when _content == prevContent and skipped _update(), but
+    // that left the document stuck on the intermediate "Loading..." text:
+    // reopening the same file's history captures prevContent as the previous
+    // session's full content (the virtual document close event does not always
+    // fire/reset), so the rebuilt identical content short-circuited and the
+    // never-refreshed document stayed on "Loading...".
+    this._update();
     if (this._content == prevContent) {
+      // Content is unchanged; _update() may not trigger onDidChangeTextDocument,
+      // so apply decorations and clear the updating flag explicitly.
       this._setDecorations(getHistoryViewEditor());
       this._updating = false;
-    } else {
-      this._update();
     }
 
     this.repo = context.repo.root; // Update the status bar UI.
